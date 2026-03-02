@@ -1,0 +1,39 @@
+monitoring:
+  hourly_check_interval: 3600
+  daily_eval_hour: 2          # 2 AM
+  weekly_eval_day: 0          # Monday
+
+thresholds:
+  performance:
+    rmse_increase_pct: 15
+    mae_increase_pct: 15
+    r2_decrease: 0.05
+    prediction_latency_ms: 100
+
+  drift:
+    psi_threshold: 0.2
+    ks_statistic_threshold: 0.1
+    chi2_pvalue_threshold: 0.05
+    mean_shift_threshold: 0.15
+    std_shift_threshold: 0.20
+    critical_drift_rate: 0.30
+    high_drift_rate: 0.15
+    medium_drift_rate: 0.05
+
+  data_quality:
+    min_quality_rate: 0.90
+    acceptable_null_rate: 0.05
+    out_of_range_buffer: 0.10
+    extreme_value_zscore: 3.0
+
+  retraining:
+    performance_degradation_pct: 10
+    drift_severity_trigger: high
+    min_days_since_training: 30
+    min_new_samples: 10000
+
+alerts:
+  channels:
+    - console
+    # - email
+    # - slack
