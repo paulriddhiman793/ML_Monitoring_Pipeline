@@ -8,6 +8,7 @@ Each adapter knows how to:
 To add a new backend: subclass BaseAdapter and register it.
 """
 from typing import Any, Dict, Optional
+import inspect
 
 
 class BaseAdapter:
@@ -212,6 +213,13 @@ def get_adapter(adapter_config: Dict[str, Any]) -> BaseAdapter:
             f"Unknown adapter type '{adapter_type}'. "
             f"Available: {list(ADAPTER_REGISTRY.keys())}"
         )
-    # Pass all config keys except 'type' as constructor kwargs
-    kwargs = {k: v for k, v in adapter_config.items() if k != "type"}
+
+    # Only pass kwargs that the adapter's __init__ actually accepts
+    # This prevents CLI flags like --prediction-field breaking
+    # adapters that don't use them (e.g. dog_health, classification)
+    valid_params = inspect.signature(cls.__init__).parameters
+    kwargs = {
+        k: v for k, v in adapter_config.items()
+        if k != "type" and k in valid_params
+    }
     return cls(**kwargs)
