@@ -35,14 +35,20 @@ def load_config(config_path: str = "config/config.yaml") -> dict:
 
 @app_cli.command()
 def start(
-    backend_url: str = typer.Option(None, "--backend-url", "-b", help="ML backend API URL"),
-    api_key: str = typer.Option(None, "--api-key", "-k", help="API key for backend"),
+    backend_url: str = typer.Option(None, "--backend-url", "-b"),
+    api_key: str = typer.Option(None, "--api-key", "-k"),
+    adapter: str = typer.Option("flat", "--adapter", "-a",
+        help="Adapter type: flat | nested | wrapped | classification | list | dog_health"),
+    prediction_field: str = typer.Option("prediction", "--prediction-field",
+        help="Field name containing the prediction in the response"),
+    data_key: str = typer.Option("data", "--data-key",
+        help="For nested adapter: outer key containing prediction data"),
+    predict_endpoint: str = typer.Option("/predict", "--predict-endpoint"),
+    model_info_endpoint: str = typer.Option("/model/info", "--model-info-endpoint"),
     config: str = typer.Option("config/config.yaml", "--config", "-c"),
     host: str = typer.Option("0.0.0.0", "--host"),
     port: int = typer.Option(8080, "--port"),
-    no_dashboard: bool = typer.Option(False, "--no-dashboard"),
 ):
-    """Start the ML Model Monitoring Pipeline."""
     from pipeline.orchestrator import MLMonitoringPipeline
     from dashboard.app import app as fastapi_app, set_pipeline
 
@@ -52,30 +58,27 @@ def start(
     if api_key:
         cfg["ml_api_key"] = api_key
 
-    console.print(f"\n[bold cyan]ML Monitoring Pipeline[/bold cyan]")
-    console.print(f"Backend: [yellow]{cfg['ml_backend_url']}[/yellow]")
-    console.print(f"Dashboard: [yellow]http://{host}:{port}[/yellow]\n")
+    cfg["predict_endpoint"] = predict_endpoint
+    cfg["model_info_endpoint"] = model_info_endpoint
 
-    # Build pipeline
+    # Build adapter config from CLI flags
+    cfg["adapter"] = {
+        "type": adapter,
+        "prediction_field": prediction_field,
+        **({"data_key": data_key} if adapter == "nested" else {}),
+    }
+
     pipeline = MLMonitoringPipeline(cfg)
     pipeline.start()
     set_pipeline(pipeline)
 
-    # Graceful shutdown
     def shutdown(sig, frame):
-        console.print("\n[yellow]Shutting down…[/yellow]")
-        pipeline.stop()
-        sys.exit(0)
+        pipeline.stop(); sys.exit(0)
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
 
-    if not no_dashboard:
-        console.print(f"[green]Dashboard → http://{host}:{port}/docs[/green]")
-        uvicorn.run(fastapi_app, host=host, port=port, log_level="warning")
-    else:
-        console.print("Running without dashboard. Press Ctrl+C to stop.")
-        while True:
-            time.sleep(1)
+    console.print(f"[green]Dashboard → http://{host}:{port}/docs[/green]")
+    uvicorn.run(fastapi_app, host=host, port=port, log_level="warning")
 
 
 @app_cli.command()

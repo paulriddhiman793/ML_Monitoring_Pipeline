@@ -1,8 +1,6 @@
 """
-Prediction Proxy — Dog Health Monitoring
-Intercepts all predictions for monitoring before/after hitting the backend.
+Prediction Proxy — fully generic
 """
-import uuid
 from datetime import datetime
 from typing import Any, Callable, Dict, Optional
 
@@ -26,14 +24,7 @@ class PredictionProxy:
 
     def predict(self, features: Dict[str, Any],
                 metadata: Optional[Dict] = None) -> Dict[str, Any]:
-        """
-        Full monitored prediction flow:
-        1. Validate data quality
-        2. Call dog health backend
-        3. Log prediction + extra dog-specific fields
-        4. Fire callbacks
-        """
-        # 1. Data quality
+        # 1. Quality check
         quality_report = self.quality_monitor.validate_input(features)
         self.logger.log_quality(quality_report)
 
@@ -47,38 +38,23 @@ class PredictionProxy:
 
         # 2. Backend call
         result = self.backend.predict(features)
-
         if not result["success"]:
-            return {
-                "error": result.get("error", "Backend error"),
-                "prediction": None,
-                "prediction_id": None,
-            }
+            return {"error": result.get("error"), "prediction": None, "prediction_id": None}
 
-        # 3. Log — store risk_score as prediction_value
+        # 3. Log — extra fields go into metadata (adapter-provided, domain-agnostic)
         prediction_id = self.logger.log_prediction(
             features=features,
-            prediction_value=result["prediction"],      # risk_score
+            prediction_value=result["prediction"],
             inference_time_ms=result["inference_time_ms"],
-            metadata={
-                **(metadata or {}),
-                "health_condition": result.get("health_condition"),
-                "risk_level": result.get("risk_level"),
-                "recommendation": result.get("recommendation"),
-                "environmental_analysis": result.get("environmental_analysis", {}),
-            },
+            metadata={**(metadata or {}), **result.get("extra", {})},
             quality_flags=quality_report,
         )
 
         response = {
             "prediction_id": prediction_id,
-            # Core numeric score
-            "risk_score": result["prediction"],
-            # Human-readable dog health fields
-            "health_condition": result.get("health_condition"),
-            "risk_level": result.get("risk_level"),
-            "recommendation": result.get("recommendation"),
-            "environmental_analysis": result.get("environmental_analysis", {}),
+            "prediction": result["prediction"],
+            # Extra fields pass through transparently — whatever the adapter extracted
+            **result.get("extra", {}),
             "inference_time_ms": result["inference_time_ms"],
             "quality_warnings": quality_report.get("warnings", []),
         }
@@ -92,9 +68,5 @@ class PredictionProxy:
         return response
 
     def submit_ground_truth(self, prediction_id: str,
-                            actual_risk_score: float) -> Dict[str, Any]:
-        """
-        Log the true risk score for a past prediction.
-        actual_risk_score: the real observed risk (0.0 – 1.0 or raw score).
-        """
-        return self.logger.log_ground_truth(prediction_id, actual_risk_score)
+                            actual_value: float) -> Dict[str, Any]:
+        return self.logger.log_ground_truth(prediction_id, actual_value)
