@@ -1,6 +1,6 @@
 # ML Monitoring Pipeline
 
-A production-ready ML model monitoring pipeline with real-time drift detection, performance tracking, and an interactive dashboard.
+An ML model monitoring pipeline with real-time drift detection, performance tracking, and an interactive dashboard.
 
 ---
 
