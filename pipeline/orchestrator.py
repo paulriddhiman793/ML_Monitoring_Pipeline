@@ -1,40 +1,24 @@
 """
 pipeline/orchestrator.py
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Generic ML Model Monitoring Pipeline Orchestrator
 
-Completely domain-agnostic — works with any ML backend regardless of:
-  • Response format  (handled by adapter)
-  • Feature types    (inferred automatically or supplied in config)
-  • Model task       (regression, classification, scoring, ranking)
-  • Prediction field (configured via adapter)
+Three operating modes:
+  Mode 1 — Auto-simulation  : background thread fires synthetic predictions
+  Mode 2 — Continuous feed  : browser UI drives a prediction loop
+  Mode 3 — Production       : waits for POST /predict from your real app
 
-Configuration priority (highest → lowest):
-  1. Explicit config dict passed to __init__
-  2. Environment variables
-  3. Defaults baked into this file
-
-Usage (any backend):
-    from pipeline.orchestrator import MLMonitoringPipeline
-
-    pipeline = MLMonitoringPipeline({
-        "ml_backend_url": "https://your-model-api.com",
-        "adapter": {"type": "flat", "prediction_field": "score"},
-    })
-    pipeline.start()
-
-    result = pipeline.predict({"feature_a": 1.2, "feature_b": "cat"})
-    pipeline.submit_ground_truth(result["prediction_id"], actual_value=1.5)
-
-    pipeline.stop()
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Domain-agnostic — all backend-specific knowledge lives in the adapter.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
-import os
+import threading
+import time
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional
 
@@ -43,7 +27,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from rich.console import Console
 from rich.table import Table
 
-from api.adapters import BaseAdapter, get_adapter
+from api.adapters import ADAPTER_REGISTRY, BaseAdapter
 from api.client import MLBackendClient
 from api.proxy import PredictionProxy
 from core.alerts import AlertSystem
@@ -59,16 +43,12 @@ console = Console()
 log = logging.getLogger(__name__)
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ─────────────────────────────────────────────────────────────
 # Helpers
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ─────────────────────────────────────────────────────────────
 
 def _infer_feature_stats(df: pd.DataFrame) -> Dict[str, Any]:
-    """
-    Automatically infer baseline statistics from a DataFrame of feature rows.
-    Called the first time we have enough predictions to build a baseline.
-    Handles both numerical and categorical columns.
-    """
+    """Auto-build baseline statistics from a DataFrame of feature rows."""
     stats: Dict[str, Any] = {}
     for col in df.columns:
         series = df[col].dropna()
@@ -76,26 +56,25 @@ def _infer_feature_stats(df: pd.DataFrame) -> Dict[str, Any]:
             continue
         if pd.api.types.is_numeric_dtype(series):
             stats[col] = {
-                "type": "numerical",
-                "mean": float(series.mean()),
-                "std": float(series.std()) if len(series) > 1 else 1.0,
-                "min": float(series.min()),
-                "max": float(series.max()),
+                "type":         "numerical",
+                "mean":         float(series.mean()),
+                "std":          float(series.std()) if len(series) > 1 else 1.0,
+                "min":          float(series.min()),
+                "max":          float(series.max()),
                 "missing_rate": float(df[col].isna().mean()),
             }
         else:
             vc = series.value_counts(normalize=True)
             stats[col] = {
-                "type": "categorical",
-                "categories": vc.index.tolist(),
+                "type":                  "categorical",
+                "categories":            vc.index.tolist(),
                 "category_distribution": vc.to_dict(),
-                "missing_rate": float(df[col].isna().mean()),
+                "missing_rate":          float(df[col].isna().mean()),
             }
     return stats
 
 
 def _preds_to_df(predictions: List[Dict]) -> Optional[pd.DataFrame]:
-    """Parse a list of prediction DB rows into a feature DataFrame."""
     rows = []
     for p in predictions:
         try:
@@ -107,40 +86,53 @@ def _preds_to_df(predictions: List[Dict]) -> Optional[pd.DataFrame]:
     return pd.DataFrame(rows) if rows else None
 
 
-def _resolve_db_path(database_url: str) -> str:
-    """Strip SQLAlchemy prefixes to get a plain file path for our DB wrapper."""
+def _resolve_db_path(url: str) -> str:
     return (
-        database_url
+        url
         .replace("sqlite+aiosqlite:///./", "")
         .replace("sqlite:///./", "")
         .replace("sqlite:///", "")
     )
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ─────────────────────────────────────────────────────────────
 # Pipeline
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ─────────────────────────────────────────────────────────────
 
 class MLMonitoringPipeline:
     """
-    Generic ML model monitoring pipeline.
+    Generic ML monitoring pipeline — works with any backend + adapter.
 
-    Accepts any backend URL + adapter combination.
-    No domain-specific logic lives here — all backend-specific
-    knowledge belongs in the adapter (api/adapters.py).
+    Mode 1 — Auto-simulation
+        pipeline.start_simulation(feature_generator, interval_seconds=5)
+        Background thread fires predictions on a timer.
 
-    Lifecycle:
-        __init__  → connect, load/build baseline, wire components
-        start()   → launch background scheduler
-        predict() → monitored prediction (quality check → backend → log)
-        stop()    → graceful shutdown
+    Mode 2 — Continuous frontend feed
+        pipeline.start_continuous_feed_mode()
+        The dashboard UI's JavaScript loop calls POST /feed/predict repeatedly.
+        pipeline.record_feed_prediction() increments the counter each time.
+
+    Mode 3 — Production (default)
+        pipeline.set_production_mode()
+        Just start() and wait — your app calls POST /predict.
     """
 
-    # ── Construction ───────────────────────────────────────────────────────
+    # ── Init ──────────────────────────────────────────────────
 
     def __init__(self, config: Dict[str, Any]) -> None:
-        self.config = config
-        self.running = False
+        self.config      = config
+        self.running     = False
+        self.active_mode: Optional[int] = None
+
+        # Simulation state (Mode 1)
+        self._sim_running: bool = False
+        self._sim_count:   int  = 0
+        self._sim_thread:  Optional[threading.Thread] = None
+
+        # Continuous feed state (Mode 2)
+        self._feed_armed:   bool = False
+        self._feed_count:   int  = 0
+
         self._callbacks: List[Callable[[Dict], None]] = []
 
         self._setup_database()
@@ -149,139 +141,118 @@ class MLMonitoringPipeline:
         self._setup_components()
         self._setup_scheduler()
 
-    # ── Setup phases (called once during __init__) ─────────────────────────
+    # ── Setup phases ──────────────────────────────────────────
 
     def _setup_database(self) -> None:
-        db_url = self.config.get("database_url", "monitoring.db")
-        self.db = Database(_resolve_db_path(db_url))
-        console.print(f"[dim]Database: {_resolve_db_path(db_url)}[/dim]")
+        db_path  = _resolve_db_path(self.config.get("database_url", "monitoring.db"))
+        self.db  = Database(db_path)
+        console.print(f"[dim]Database  : {db_path}[/dim]")
 
     def _setup_backend(self) -> None:
-        """
-        Build the adapter and backend client.
-        The adapter is the only piece that knows about backend response shapes.
-        """
-        adapter_config: Dict[str, Any] = self.config.get("adapter", {"type": "flat"})
-        self.adapter: BaseAdapter = get_adapter(adapter_config)
+        adapter_cfg  = self.config.get("adapter", {"type": "flat"})
+        adapter_type = adapter_cfg.get("type", "flat")
+
+        cls = ADAPTER_REGISTRY.get(adapter_type)
+        if cls is None:
+            raise ValueError(
+                f"Unknown adapter '{adapter_type}'. "
+                f"Available: {list(ADAPTER_REGISTRY.keys())}"
+            )
+        # Only forward kwargs that the adapter's __init__ actually declares
+        valid  = inspect.signature(cls.__init__).parameters
+        kwargs = {k: v for k, v in adapter_cfg.items() if k != "type" and k in valid}
+        self.adapter: BaseAdapter = cls(**kwargs)
 
         self.backend = MLBackendClient(
             base_url=self.config["ml_backend_url"],
             adapter=self.adapter,
             api_key=self.config.get("ml_api_key"),
-            predict_endpoint=self.config.get("predict_endpoint", "/predict"),
+            predict_endpoint=self.config.get("predict_endpoint",    "/predict"),
             model_info_endpoint=self.config.get("model_info_endpoint", "/model/info"),
-            health_endpoint=self.config.get("health_endpoint", "/health"),
+            health_endpoint=self.config.get("health_endpoint",      "/health"),
         )
 
         console.print(f"[cyan]Connecting → {self.config['ml_backend_url']}[/cyan]")
-
-        # Probe the backend for model metadata
-        model_info = self.backend.get_model_info()
-        self.model_version: str = (
+        self._model_info     = self.backend.get_model_info()
+        self.model_version   = (
             self.config.get("model_version")
-            or model_info.get("model_version", "v1")
+            or self._model_info.get("model_version", "v1")
         )
-        self._model_info = model_info
-        console.print(f"[green]✓ Model version: {self.model_version}[/green]")
-
-        baseline_metrics = model_info.get("baseline_metrics", {})
-        if baseline_metrics:
-            readable = "  ".join(f"{k}={v:.4f}" for k, v in baseline_metrics.items() if v)
-            if readable:
-                console.print(f"[green]  {readable}[/green]")
+        console.print(f"[green]✓ Model    : {self.model_version}[/green]")
+        bm = self._model_info.get("baseline_metrics", {})
+        if bm:
+            parts = "  ".join(f"{k}={v:.4f}" for k, v in bm.items() if v)
+            if parts:
+                console.print(f"[green]  {parts}[/green]")
 
     def _setup_baseline(self) -> None:
-        """
-        Resolve baseline feature statistics from the highest-priority source:
-          1. Already in DB  (persisted from a prior run)
-          2. Supplied in config as baseline_stats dict
-          3. Fetched from the backend's /features or equivalent endpoint
-          4. Deferred — will be built automatically after MIN_SAMPLES_FOR_BASELINE
-             predictions have been logged (lazy bootstrap)
+        MIN = self.config.get("min_samples_for_baseline", 50)
+        self._min_samples = MIN
 
-        Also seeds the training_runs table with backend metrics if first run.
-        """
-        MIN_SAMPLES_FOR_BASELINE = self.config.get("min_samples_for_baseline", 50)
-
-        # Source 1: DB
-        baseline_stats = self.db.get_baseline_stats(self.model_version)
-        if baseline_stats:
-            console.print(f"[green]✓ Baseline loaded from DB ({len(baseline_stats)} features)[/green]")
-            self.baseline_stats = baseline_stats
+        # Source 1: DB (fastest — used on every subsequent run)
+        bs = self.db.get_baseline_stats(self.model_version)
+        if bs:
+            console.print(f"[green]✓ Baseline : DB ({len(bs)} features)[/green]")
+            self.baseline_stats  = bs
             self._baseline_ready = True
-            self._min_samples_for_baseline = MIN_SAMPLES_FOR_BASELINE
             self._seed_training_run_if_missing()
             return
 
-        # Source 2: Config
+        # Source 2: Explicit config
         if self.config.get("baseline_stats"):
-            baseline_stats = self.config["baseline_stats"]
-            console.print(f"[green]✓ Baseline from config ({len(baseline_stats)} features)[/green]")
-            self._persist_baseline(baseline_stats)
-            self.baseline_stats = baseline_stats
+            bs = self.config["baseline_stats"]
+            console.print(f"[green]✓ Baseline : config ({len(bs)} features)[/green]")
+            self._persist_baseline(bs)
+            self.baseline_stats  = bs
             self._baseline_ready = True
-            self._min_samples_for_baseline = MIN_SAMPLES_FOR_BASELINE
             self._seed_training_run_if_missing()
             return
 
-        # Source 3: Backend /features endpoint (if adapter supports it)
-        backend_baseline = self._fetch_baseline_from_backend()
-        if backend_baseline:
-            console.print(f"[green]✓ Baseline from backend ({len(backend_baseline)} features)[/green]")
-            self._persist_baseline(backend_baseline)
-            self.baseline_stats = backend_baseline
+        # Source 3: Adapter's get_baseline_stats() hook (optional)
+        bs = self._fetch_baseline_from_backend()
+        if bs:
+            console.print(f"[green]✓ Baseline : backend ({len(bs)} features)[/green]")
+            self._persist_baseline(bs)
+            self.baseline_stats  = bs
             self._baseline_ready = True
-            self._min_samples_for_baseline = MIN_SAMPLES_FOR_BASELINE
             self._seed_training_run_if_missing()
             return
 
-        # Source 4: Deferred — will be inferred from first N predictions
+        # Source 4: Deferred — auto-built after MIN predictions
         console.print(
-            f"[yellow]⚠ No baseline stats found. Will auto-infer after "
-            f"{MIN_SAMPLES_FOR_BASELINE} predictions.[/yellow]"
+            f"[yellow]⚠ Baseline : deferred "
+            f"(auto-builds after {MIN} predictions)[/yellow]"
         )
-        self.baseline_stats = {}
+        self.baseline_stats  = {}
         self._baseline_ready = False
-        self._min_samples_for_baseline = MIN_SAMPLES_FOR_BASELINE
 
     def _setup_components(self) -> None:
-        """Wire all monitoring components together."""
-        thresholds = self.config.get("thresholds", {})
-
-        self.logger = MLMonitoringLogger(self.db, self.model_version)
-
-        self.quality_monitor = DataQualityMonitor(
+        T = self.config.get("thresholds", {})
+        self.logger               = MLMonitoringLogger(self.db, self.model_version)
+        self.quality_monitor      = DataQualityMonitor(
             baseline_stats=self.baseline_stats,
             validation_rules=self.config.get("validation_rules", []),
         )
-
-        self.performance_monitor = ModelPerformanceMonitor(
-            self.db, self.model_version
-        )
-
-        self.drift_detector = DataDriftDetector(
+        self.performance_monitor  = ModelPerformanceMonitor(self.db, self.model_version)
+        self.drift_detector       = DataDriftDetector(
             baseline_stats=self.baseline_stats,
-            thresholds=thresholds.get("drift"),
+            thresholds=T.get("drift"),
         )
-
         self.explainability_monitor = ExplainabilityMonitor(
             model=self.config.get("model_object"),
             baseline_importance=self.config.get("baseline_feature_importance", {}),
         )
-
-        self.retraining_trigger = RetrainingTrigger(
+        self.retraining_trigger   = RetrainingTrigger(
             db=self.db,
             performance=self.performance_monitor,
             drift=self.drift_detector,
-            thresholds=thresholds.get("retraining"),
+            thresholds=T.get("retraining"),
         )
-
-        self.alert_system = AlertSystem(
+        self.alert_system         = AlertSystem(
             db=self.db,
-            thresholds=thresholds.get("alerts"),
+            thresholds=T.get("alerts"),
             channels=self.config.get("alert_channels", ["console"]),
         )
-
         self.proxy = PredictionProxy(
             backend_client=self.backend,
             logger=self.logger,
@@ -293,418 +264,405 @@ class MLMonitoringPipeline:
             job_defaults={"coalesce": True, "max_instances": 1}
         )
 
-    # ── Lifecycle ──────────────────────────────────────────────────────────
+    # ── Lifecycle ─────────────────────────────────────────────
 
     def start(self) -> None:
-        """Start background monitoring jobs and print status."""
+        """Start background monitoring scheduler."""
         if self.running:
-            console.print("[yellow]Pipeline already running.[/yellow]")
             return
-
         self.running = True
-        interval_s = self.config.get("monitoring_interval_seconds", 3600)
-
-        self.scheduler.add_job(
-            self.run_hourly_checks, "interval",
-            seconds=interval_s, id="hourly",
-        )
-        self.scheduler.add_job(
-            self.run_daily_evaluation, "cron",
-            hour=self.config.get("daily_eval_hour", 2), id="daily",
-        )
-        self.scheduler.add_job(
-            self.run_weekly_analysis, "cron",
-            day_of_week=self.config.get("weekly_eval_day", 0),
-            hour=3, id="weekly",
-        )
+        s = self.config.get("monitoring_interval_seconds", 3600)
+        self.scheduler.add_job(self.run_hourly_checks,    "interval", seconds=s,     id="hourly")
+        self.scheduler.add_job(self.run_daily_evaluation, "cron",     hour=self.config.get("daily_eval_hour", 2), id="daily")
+        self.scheduler.add_job(self.run_weekly_analysis,  "cron",     day_of_week=self.config.get("weekly_eval_day", 0), hour=3, id="weekly")
         self.scheduler.start()
-        console.print("[bold green]✓ Monitoring pipeline started[/bold green]")
+        console.print("[bold green]✓ Pipeline : started[/bold green]")
         self._print_status()
 
     def stop(self) -> None:
-        """Gracefully shut down the scheduler."""
+        """Gracefully stop the pipeline."""
         if not self.running:
             return
+        self.stop_simulation()
         self.running = False
         self.scheduler.shutdown(wait=False)
         console.print("[yellow]Pipeline stopped.[/yellow]")
 
     def add_prediction_callback(self, fn: Callable[[Dict], None]) -> None:
-        """
-        Register a function called after every successful prediction.
-        Useful for WebSocket feeds, custom loggers, or downstream triggers.
-        fn receives the full prediction response dict.
-        """
+        """Register a callback fired after every successful prediction."""
         self._callbacks.append(fn)
         self.proxy.add_prediction_callback(fn)
 
-    # ── Public prediction API ──────────────────────────────────────────────
+    # ── Prediction API ────────────────────────────────────────
 
     def predict(
         self,
         features: Dict[str, Any],
         metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """
-        Route a prediction through the full monitoring pipeline:
-          data quality check → backend call → log → lazy baseline bootstrap
-        Returns the backend response enriched with prediction_id and quality info.
-        """
+        """Route one prediction through quality check → backend → log."""
         result = self.proxy.predict(features, metadata)
-
-        # Lazy baseline: once enough predictions exist, auto-build baseline
         if not self._baseline_ready:
             self._try_bootstrap_baseline()
-
         return result
 
-    def submit_ground_truth(
-        self, prediction_id: str, actual_value: float
-    ) -> Dict[str, Any]:
-        """
-        Log the real observed outcome for a past prediction.
-        This enables performance metrics (RMSE, MAE, R²) to be computed.
-        actual_value must be on the same scale as the predicted value.
-        """
+    def submit_ground_truth(self, prediction_id: str, actual_value: float) -> Dict[str, Any]:
+        """Log the real outcome for a past prediction (enables RMSE/R²)."""
         return self.proxy.submit_ground_truth(prediction_id, actual_value)
 
     def register_training_run(self, metadata: Dict[str, Any]) -> None:
-        """
-        Register a new training run and update baseline statistics.
-        Call this whenever the model is retrained so the pipeline
-        recalibrates its drift and performance baselines.
-
-        metadata keys:
-            run_id          (str)   unique identifier for this run
-            model_type      (str)   e.g. "CatBoost", "XGBoost", "RandomForest"
-            params          (dict)  hyperparameters used
-            metrics         (dict)  training/validation metrics {"rmse": 0.1, "r2": 0.9}
-            feature_importance (dict) {feature_name: importance_score}
-            data_stats      (dict)  baseline stats per feature (same schema as baseline_stats)
-        """
+        """Register a new training run and refresh baselines."""
         self.logger.log_training_run(metadata)
-
         if "data_stats" in metadata:
             self._persist_baseline(metadata["data_stats"])
-            new_baseline = self.db.get_baseline_stats(self.model_version)
-            self._update_baseline(new_baseline)
-
+            self._update_baseline(self.db.get_baseline_stats(self.model_version))
         console.print("[green]✓ Training run registered — baseline updated.[/green]")
 
-    # ── Scheduled evaluation jobs ──────────────────────────────────────────
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # MODE 1 — Auto-simulation
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    def start_simulation(
+        self,
+        feature_generator:  Callable[[], Dict[str, Any]],
+        interval_seconds:   float = 5.0,
+        max_predictions:    int   = 0,
+        auto_ground_truth:  bool  = False,
+        ground_truth_fn:    Optional[Callable[[Dict], float]] = None,
+    ) -> None:
+        """
+        Start Mode 1 — auto-simulation.
+
+        Args:
+            feature_generator  : callable that returns a feature dict on each call
+            interval_seconds   : seconds between each automatic prediction
+            max_predictions    : stop after N predictions (0 = run forever)
+            auto_ground_truth  : immediately submit simulated ground truth
+            ground_truth_fn    : callable(result) → float (required if auto_ground_truth)
+        """
+        if self._sim_running:
+            console.print("[yellow]Simulation already running.[/yellow]")
+            return
+
+        self.active_mode   = 1
+        self._sim_running  = True
+        self._sim_count    = 0
+
+        def _loop() -> None:
+            while self._sim_running:
+                if max_predictions > 0 and self._sim_count >= max_predictions:
+                    self._sim_running = False
+                    console.print(f"[green]▶ Simulation complete — {self._sim_count} predictions sent.[/green]")
+                    break
+                try:
+                    features = feature_generator()
+                    result   = self.predict(features)
+                    self._sim_count += 1
+
+                    if auto_ground_truth and ground_truth_fn and result.get("prediction_id"):
+                        actual = ground_truth_fn(result)
+                        self.submit_ground_truth(result["prediction_id"], actual)
+
+                    console.print(
+                        f"[dim]  [sim {self._sim_count:04d}] "
+                        f"pred={result.get('prediction')}  "
+                        f"id=...{str(result.get('prediction_id',''))[-8:]}[/dim]"
+                    )
+                except Exception as exc:
+                    console.print(f"[red]Simulation error: {exc}[/red]")
+
+                time.sleep(interval_seconds)
+
+        self._sim_thread = threading.Thread(target=_loop, daemon=True, name="ml-sim-loop")
+        self._sim_thread.start()
+
+    def stop_simulation(self) -> Dict[str, Any]:
+        """Stop Mode 1 simulation."""
+        if not self._sim_running:
+            return {"stopped": False, "reason": "not running"}
+        self._sim_running = False
+        count = self._sim_count
+        console.print(f"[yellow]■ Simulation stopped — {count} predictions sent.[/yellow]")
+        return {"stopped": True, "total_predictions_sent": count}
+
+    def simulation_status(self) -> Dict[str, Any]:
+        return {
+            "running":          self._sim_running,
+            "predictions_sent": self._sim_count,
+            "mode":             self.active_mode,
+        }
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # MODE 2 — Continuous frontend feed
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    def start_continuous_feed_mode(self) -> Dict[str, Any]:
+        """
+        Arm Mode 2. The browser UI will call POST /feed/predict in a loop.
+        This method just flips the flag and resets the counter — no thread needed.
+        """
+        self.active_mode  = 2
+        self._feed_armed  = True
+        self._feed_count  = 0
+        console.print("[bold yellow]▶ Mode 2 — Continuous feed mode armed.[/bold yellow]")
+        return {"mode": 2, "armed": True}
+
+    def stop_continuous_feed_mode(self) -> Dict[str, Any]:
+        self._feed_armed = False
+        console.print("[yellow]■ Continuous feed stopped.[/yellow]")
+        return {"mode": 2, "armed": False, "predictions_sent": self._feed_count}
+
+    def record_feed_prediction(self) -> None:
+        """Called by the API layer after each /feed/predict request."""
+        if self._feed_armed:
+            self._feed_count += 1
+
+    def continuous_feed_status(self) -> Dict[str, Any]:
+        return {
+            "armed":            self._feed_armed,
+            "predictions_sent": self._feed_count,
+            "mode":             self.active_mode,
+        }
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # MODE 3 — Production
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    def set_production_mode(self) -> Dict[str, Any]:
+        """Arm Mode 3 — just sets the flag, no extra work needed."""
+        self.active_mode = 3
+        console.print("[bold magenta]▶ Mode 3 — Production mode active.[/bold magenta]")
+        return {"mode": 3}
+
+    # ── Scheduled jobs ────────────────────────────────────────
 
     def run_hourly_checks(self) -> Dict[str, Any]:
-        """
-        Lightweight checks — run every hour (or configured interval).
-        • Count predictions
-        • Compute data quality rate
-        • Track average latency
-        • Fire latency / quality alerts
-        """
-        ts = datetime.now()
+        ts   = datetime.now()
         console.print(f"[dim]{ts:%H:%M} — Hourly check[/dim]")
-
-        preds = self.db.get_recent_predictions(hours=1)
+        preds   = self.db.get_recent_predictions(hours=1)
         quality = self.quality_monitor.get_quality_summary(self.db, hours=1)
-
-        avg_latency = (
+        avg_lat = (
             sum(p.get("prediction_time_ms") or 0 for p in preds) / len(preds)
             if preds else 0.0
         )
-
-        hourly_snapshot = {
-            "timestamp": ts.isoformat(),
+        snap = {
+            "timestamp":         ts.isoformat(),
             "predictions_count": len(preds),
             "data_quality_rate": quality.get("data_quality_rate", 1.0),
-            "avg_latency_ms": avg_latency,
+            "avg_latency_ms":    avg_lat,
         }
-        self.db.insert_hourly_metric(hourly_snapshot)
-        self.alert_system.check_and_fire(hourly_snapshot)
-
-        return hourly_snapshot
+        self.db.insert_hourly_metric(snap)
+        self.alert_system.check_and_fire(snap)
+        return snap
 
     def run_daily_evaluation(self) -> Dict[str, Any]:
-        """
-        Full daily evaluation — runs at 2 AM by default.
-        • Performance metrics vs baseline (RMSE, MAE, R², bias)
-        • Data drift detection per feature (PSI, KS test)
-        • Error segment analysis
-        • Alert generation
-        """
-        ts = datetime.now()
+        ts   = datetime.now()
         console.print(f"[cyan]{ts:%Y-%m-%d} — Daily evaluation[/cyan]")
-
-        # Performance (requires ground truth to have been submitted)
         perf = self.performance_monitor.calculate_metrics(hours=24)
 
-        # Drift detection (requires predictions to exist)
         drift_report: Dict[str, Any] = {}
         if self._baseline_ready:
-            recent_preds = self.db.get_recent_predictions(hours=24)
-            feature_df = _preds_to_df(recent_preds)
-            if feature_df is not None and not feature_df.empty:
-                drift_report = self.drift_detector.detect_drift(feature_df)
+            df = _preds_to_df(self.db.get_recent_predictions(hours=24))
+            if df is not None and not df.empty:
+                drift_report = self.drift_detector.detect_drift(df)
                 self.db.insert_drift_log({
-                    "timestamp": ts.isoformat(),
-                    "drift_report": drift_report,
-                    "drift_severity": drift_report.get("drift_severity", "none"),
+                    "timestamp":           ts.isoformat(),
+                    "drift_report":        drift_report,
+                    "drift_severity":      drift_report.get("drift_severity", "none"),
                     "features_with_drift": drift_report.get("features_with_drift", []),
                 })
         else:
-            console.print("[yellow]  Drift skipped — baseline not ready yet[/yellow]")
+            console.print("[yellow]  Drift skipped — baseline not ready[/yellow]")
 
-        # Error segment analysis
         segments = self.performance_monitor.analyze_error_segments(hours=24)
-
-        # Alerts
-        combined = {**perf, **drift_report}
-        alerts = self.alert_system.check_and_fire(combined)
-
-        # Persist
+        alerts   = self.alert_system.check_and_fire({**perf, **drift_report})
         self.db.insert_daily_evaluation({
-            "date": ts.date().isoformat(),
+            "date":                ts.date().isoformat(),
             "performance_metrics": perf,
-            "drift_report": drift_report,
-            "alerts": alerts,
-            "error_segments": segments,
+            "drift_report":        drift_report,
+            "alerts":              alerts,
+            "error_segments":      segments,
         })
-
         self._log_daily_summary(perf, drift_report, alerts)
-
-        return {
-            "performance": perf,
-            "drift": drift_report,
-            "segments": segments,
-            "alerts": alerts,
-        }
+        return {"performance": perf, "drift": drift_report, "segments": segments, "alerts": alerts}
 
     def run_weekly_analysis(self) -> Dict[str, Any]:
-        """
-        Deep weekly analysis — runs Monday 3 AM by default.
-        • Feature importance shift (requires model_object in config)
-        • SHAP value analysis (requires model_object + shap installed)
-        • Drift trend over 7 days
-        • Retraining decision (multi-signal)
-        """
-        ts = datetime.now()
+        ts   = datetime.now()
         console.print(f"[magenta]{ts:%Y-%m-%d} — Weekly analysis[/magenta]")
+        imp = shap = {}
+        df  = _preds_to_df(self.db.get_recent_predictions(hours=168))
+        if df is not None and not df.empty:
+            imp  = self.explainability_monitor.calculate_importance(df)
+            shap = self.explainability_monitor.explain_sample(df)
 
-        importance_analysis: Dict[str, Any] = {}
-        shap_analysis: Dict[str, Any] = {}
-
-        recent_preds = self.db.get_recent_predictions(hours=168)
-        feature_df = _preds_to_df(recent_preds)
-        if feature_df is not None and not feature_df.empty:
-            importance_analysis = self.explainability_monitor.calculate_importance(feature_df)
-            shap_analysis = self.explainability_monitor.explain_sample(feature_df)
-
-        drift_summary = self.drift_detector.get_drift_summary(self.db, days=7)
+        drift_summary    = self.drift_detector.get_drift_summary(self.db, days=7)
         retrain_decision = self.retraining_trigger.should_retrain()
 
         if retrain_decision.get("should_retrain"):
             job = self.retraining_trigger.schedule_retraining(retrain_decision)
             console.print(
-                f"[bold red]⚠ Retraining scheduled — "
-                f"job_id={job.get('job_id')}  "
+                f"[bold red]⚠ Retraining scheduled: {job.get('job_id')}  "
                 f"confidence={retrain_decision.get('confidence')}[/bold red]"
             )
 
         self.db.insert_weekly_analysis({
-            "week_ending": ts.date().isoformat(),
-            "importance_analysis": importance_analysis,
-            "shap_analysis": shap_analysis,
-            "drift_summary": drift_summary,
-            "retrain_decision": retrain_decision,
+            "week_ending":         ts.date().isoformat(),
+            "importance_analysis": imp,
+            "shap_analysis":       shap,
+            "drift_summary":       drift_summary,
+            "retrain_decision":    retrain_decision,
         })
-
         return {
-            "importance_analysis": importance_analysis,
-            "shap_analysis": shap_analysis,
-            "drift_summary": drift_summary,
-            "retrain_decision": retrain_decision,
+            "importance_analysis": imp,
+            "shap_analysis":       shap,
+            "drift_summary":       drift_summary,
+            "retrain_decision":    retrain_decision,
         }
 
-    # ── Dashboard snapshot ─────────────────────────────────────────────────
+    # ── Dashboard snapshot ────────────────────────────────────
 
     def get_dashboard_data(self) -> Dict[str, Any]:
-        """
-        Single call that returns everything the dashboard needs.
-        Consumed by GET /dashboard in the FastAPI layer.
-        """
-        perf = self.performance_monitor.calculate_metrics(hours=24)
+        perf    = self.performance_monitor.calculate_metrics(hours=24)
         quality = self.quality_monitor.get_quality_summary(self.db, hours=24)
-        alerts = self.db.get_recent_alerts(hours=24)
-        recent_preds = self.db.get_recent_predictions(hours=24)
+        alerts  = self.db.get_recent_alerts(hours=24)
+        recent  = self.db.get_recent_predictions(hours=24)
 
-        # Last drift report
         last_drift: Dict[str, Any] = {}
-        drift_logs = self.db.get_drift_logs(days=1)
-        if drift_logs:
+        logs = self.db.get_drift_logs(days=1)
+        if logs:
             try:
-                last_drift = json.loads(drift_logs[-1]["drift_report"])
+                last_drift = json.loads(logs[-1]["drift_report"])
             except (json.JSONDecodeError, KeyError):
                 pass
 
         return {
-            "model_version": self.model_version,
-            "timestamp": datetime.now().isoformat(),
-            "pipeline_running": self.running,
-            "baseline_ready": self._baseline_ready,
-            "performance": perf,
-            "data_quality": quality,
-            "drift": last_drift,
-            "recent_alerts": alerts,
-            "predictions_last_24h": len(recent_preds),
-            "backend_url": self.config["ml_backend_url"],
-            "adapter_type": self.config.get("adapter", {}).get("type", "flat"),
+            "model_version":        self.model_version,
+            "timestamp":            datetime.now().isoformat(),
+            "pipeline_running":     self.running,
+            "baseline_ready":       self._baseline_ready,
+            "active_mode":          self.active_mode,
+            "mode_label":           {1: "Auto-Simulation", 2: "Continuous Feed", 3: "Production"}.get(self.active_mode, "Not set"),
+            "simulation_status":    self.simulation_status(),
+            "feed_status":          self.continuous_feed_status(),
+            "performance":          perf,
+            "data_quality":         quality,
+            "drift":                last_drift,
+            "recent_alerts":        alerts,
+            "predictions_last_24h": len(recent),
+            "backend_url":          self.config["ml_backend_url"],
+            "adapter_type":         self.config.get("adapter", {}).get("type", "flat"),
         }
 
-    # ── Baseline management ────────────────────────────────────────────────
+    # ── Baseline management ───────────────────────────────────
 
     def update_baseline(self, new_baseline: Dict[str, Any]) -> None:
-        """
-        Manually replace baseline statistics (e.g. after a data pipeline change).
-        Updates all components that depend on baseline in-place — no restart needed.
-        """
+        """Hot-swap baseline without restarting."""
         self._persist_baseline(new_baseline)
         self._update_baseline(new_baseline)
         console.print(f"[green]✓ Baseline updated ({len(new_baseline)} features)[/green]")
 
     def get_baseline(self) -> Dict[str, Any]:
-        """Return current baseline statistics."""
         return self.baseline_stats.copy()
 
-    # ── Private helpers ────────────────────────────────────────────────────
-
     def _persist_baseline(self, stats: Dict[str, Any]) -> None:
-        """Write baseline stats to DB."""
-        for feature_name, feature_stats in stats.items():
-            self.db.upsert_baseline_stats(self.model_version, feature_name, feature_stats)
+        for name, feat_stats in stats.items():
+            self.db.upsert_baseline_stats(self.model_version, name, feat_stats)
 
     def _update_baseline(self, stats: Dict[str, Any]) -> None:
-        """Push new baseline into all live components without restarting."""
-        self.baseline_stats = stats
+        self.baseline_stats                 = stats
         self.quality_monitor.baseline_stats = stats
-        self.drift_detector.baseline_stats = stats
-        self._baseline_ready = True
+        self.drift_detector.baseline_stats  = stats
+        self._baseline_ready                = True
 
     def _seed_training_run_if_missing(self) -> None:
-        """
-        If no training run exists for this model version yet,
-        seed one using metrics returned by the backend's model-info endpoint.
-        This gives performance monitoring a baseline to compare against.
-        """
         if self.db.get_latest_training_run(self.model_version):
             return
-
-        baseline_metrics = self._model_info.get("baseline_metrics", {})
-        if not baseline_metrics:
+        bm = self._model_info.get("baseline_metrics", {})
+        if not bm:
             return
-
         self.db.insert_training_run({
-            "training_run_id": f"init_{self.model_version}",
-            "timestamp": datetime.now().isoformat(),
-            "model_version": self.model_version,
-            "model_type": self._model_info.get("raw", {}).get("model_type", "unknown"),
-            "hyperparameters": {},
-            "training_metrics": baseline_metrics,
+            "training_run_id":    f"init_{self.model_version}",
+            "timestamp":          datetime.now().isoformat(),
+            "model_version":      self.model_version,
+            "model_type":         self._model_info.get("raw", {}).get("model_type", "unknown"),
+            "hyperparameters":    {},
+            "training_metrics":   bm,
             "feature_importance": {},
-            "data_statistics": self.baseline_stats,
+            "data_statistics":    self.baseline_stats,
         })
-        console.print("[green]✓ Training run seeded from backend model-info[/green]")
+        console.print("[green]✓ Training run seeded from backend[/green]")
 
     def _fetch_baseline_from_backend(self) -> Dict[str, Any]:
-        """
-        Ask the adapter if it can provide baseline stats from the backend.
-        Adapters may optionally implement get_baseline_stats() by calling
-        a /features or /schema endpoint. Returns empty dict if not supported.
-        """
         try:
             if hasattr(self.adapter, "get_baseline_stats"):
-                stats = self.adapter.get_baseline_stats(self.backend)
-                if stats:
-                    return stats
+                return self.adapter.get_baseline_stats(self.backend) or {}
         except Exception as exc:
             console.print(f"[dim]Could not fetch baseline from backend: {exc}[/dim]")
         return {}
 
     def _try_bootstrap_baseline(self) -> None:
-        """
-        Lazy baseline bootstrap — called after each prediction until
-        MIN_SAMPLES_FOR_BASELINE predictions have been collected.
-        Once enough data exists, infer baseline stats from real traffic.
-        """
-        all_preds = self.db.get_recent_predictions(hours=24 * 30)  # up to 30 days
-        if len(all_preds) < self._min_samples_for_baseline:
+        """Lazy bootstrap: build baseline from first N predictions."""
+        all_preds = self.db.get_recent_predictions(hours=24 * 30)
+        if len(all_preds) < self._min_samples:
             return
-
-        feature_df = _preds_to_df(all_preds)
-        if feature_df is None or feature_df.empty:
+        df = _preds_to_df(all_preds)
+        if df is None or df.empty:
             return
-
-        inferred = _infer_feature_stats(feature_df)
+        inferred = _infer_feature_stats(df)
         if not inferred:
             return
-
         self._persist_baseline(inferred)
         self._update_baseline(inferred)
         self._seed_training_run_if_missing()
-
         console.print(
             f"[bold green]✓ Baseline auto-built from {len(all_preds)} predictions "
             f"({len(inferred)} features)[/bold green]"
         )
 
-    def _log_daily_summary(
-        self,
-        perf: Dict[str, Any],
-        drift: Dict[str, Any],
-        alerts: List[Dict],
-    ) -> None:
+    # ── Logging ───────────────────────────────────────────────
+
+    def _log_daily_summary(self, perf, drift, alerts) -> None:
         parts = []
-        if "rmse" in perf:
-            parts.append(f"RMSE={perf['rmse']:.4f}")
-        if "r2" in perf:
-            parts.append(f"R²={perf['r2']:.4f}")
+        if "rmse" in perf:      parts.append(f"RMSE={perf['rmse']:.4f}")
+        if "r2" in perf:        parts.append(f"R²={perf['r2']:.4f}")
         if "vs_baseline" in perf:
             chg = perf["vs_baseline"].get("rmse_change", 0)
             parts.append(f"RMSE_Δ={chg:+.1f}%")
         if drift:
-            parts.append(f"Drift={drift.get('drift_severity', 'none')}")
+            parts.append(f"Drift={drift.get('drift_severity','none')}")
             n = len(drift.get("features_with_drift", []))
-            if n:
-                parts.append(f"({n} features)")
+            if n: parts.append(f"({n} features)")
         parts.append(f"Alerts={len(alerts)}")
         console.print(f"[cyan]  {' · '.join(parts)}[/cyan]")
 
     def _print_status(self) -> None:
-        table = Table(
+        tbl = Table(
             title="ML Monitoring Pipeline",
             show_header=True,
             header_style="bold cyan",
+            box=None,
         )
-        table.add_column("Component", style="cyan", min_width=28)
-        table.add_column("Status", style="green")
-        table.add_column("Detail", style="dim")
-
-        rows = [
-            ("Logging",                "✓ Active",  "predictions · ground truth · quality"),
-            ("Data Quality Monitor",   "✓ Active",  "missing · out-of-range · business rules"),
-            ("Performance Monitor",    "✓ Active",  "RMSE · MAE · R² · bias · segments"),
-            ("Drift Detector",         "✓ Active",  "PSI · KS test · chi² (categorical)"),
-            ("Explainability Monitor", "✓ Active",  "feature importance · SHAP values"),
-            ("Retraining Trigger",     "✓ Active",  "multi-signal · confidence scoring"),
-            ("Alert System",           "✓ Active",  "console" + (" · slack" if self.config.get("slack_webhook") else "")),
-        ]
-        for name, status, detail in rows:
-            table.add_row(name, status, detail)
-
-        table.add_section()
-        table.add_row("Model Version",   self.model_version,                           "")
-        table.add_row("Backend",         self.config["ml_backend_url"],                "")
-        table.add_row("Adapter",         self.config.get("adapter", {}).get("type", "flat"), "")
-        table.add_row("Baseline",        "✓ Ready" if self._baseline_ready
-                      else f"⏳ Waiting for {self._min_samples_for_baseline} predictions", "")
-        table.add_row("DB",              _resolve_db_path(self.config.get("database_url", "monitoring.db")), "")
-
-        console.print(table)
+        tbl.add_column("Component",  style="cyan",  min_width=26)
+        tbl.add_column("Status",     style="green", min_width=10)
+        tbl.add_column("Detail",     style="dim")
+        for name, detail in [
+            ("Logging",                "predictions · ground truth · quality"),
+            ("Data Quality Monitor",   "missing · out-of-range · business rules"),
+            ("Performance Monitor",    "RMSE · MAE · R² · bias · segments"),
+            ("Drift Detector",         "PSI · KS · chi² (categorical)"),
+            ("Explainability Monitor", "feature importance · SHAP"),
+            ("Retraining Trigger",     "multi-signal · confidence scoring"),
+            ("Alert System",           "console"),
+        ]:
+            tbl.add_row(name, "✓ Active", detail)
+        tbl.add_section()
+        tbl.add_row("Model",    self.model_version, "")
+        tbl.add_row("Backend",  self.config["ml_backend_url"], "")
+        tbl.add_row("Adapter",  self.config.get("adapter", {}).get("type", "flat"), "")
+        tbl.add_row(
+            "Baseline",
+            "✓ Ready" if self._baseline_ready
+            else f"⏳ needs {self._min_samples} predictions",
+            "",
+        )
+        console.print(tbl)
